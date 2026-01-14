@@ -6,6 +6,51 @@ const config_mod = @import("../core/config.zig");
 const prompt = @import("prompt.zig");
 
 const log = std.log.scoped(.tui);
+const unicode = std.unicode;
+
+/// 计算 UTF-8 字符串的显示宽度（中文字符宽度为 2）
+fn displayWidth(s: []const u8) usize {
+    var width: usize = 0;
+    var iter = unicode.Utf8Iterator{ .bytes = s, .i = 0 };
+    while (iter.nextCodepoint()) |cp| {
+        // 简单判断：CJK 字符宽度为 2，其他为 1
+        if (cp >= 0x4E00 and cp <= 0x9FFF) {
+            width += 2; // CJK 基本汉字
+        } else if (cp >= 0x3400 and cp <= 0x4DBF) {
+            width += 2; // CJK 扩展 A
+        } else if (cp >= 0x20000 and cp <= 0x2A6DF) {
+            width += 2; // CJK 扩展 B
+        } else if (cp >= 0xFF00 and cp <= 0xFFEF) {
+            width += 2; // 全角字符
+        } else if (cp >= 0x3000 and cp <= 0x303F) {
+            width += 2; // CJK 标点
+        } else {
+            width += 1;
+        }
+    }
+    return width;
+}
+
+/// 删除 UTF-8 字符串末尾的一个完整字符，返回删除的字节数
+fn popUtf8Char(buffer: *std.ArrayList(u8)) usize {
+    if (buffer.items.len == 0) return 0;
+
+    // 从末尾向前找 UTF-8 字符的起始位置
+    var i: usize = buffer.items.len;
+    while (i > 0) {
+        i -= 1;
+        const byte = buffer.items[i];
+        // UTF-8 起始字节：0xxxxxxx (ASCII) 或 11xxxxxx (多字节起始)
+        if ((byte & 0x80) == 0 or (byte & 0xC0) == 0xC0) {
+            const removed = buffer.items.len - i;
+            buffer.shrinkRetainingCapacity(i);
+            return removed;
+        }
+    }
+    // 回退：删除一个字节
+    _ = buffer.pop();
+    return 1;
+}
 
 /// 自定义事件类型
 pub const Event = union(enum) {
@@ -413,11 +458,9 @@ pub fn runApp(
                     continue;
                 }
 
-                // Backspace 删除字符
+                // Backspace 删除字符（支持 UTF-8 多字节字符）
                 if (key.matches(vaxis.Key.backspace, .{})) {
-                    if (input_buffer.items.len > 0) {
-                        _ = input_buffer.pop();
-                    }
+                    _ = popUtf8Char(&input_buffer);
                     try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
                     continue;
                 }
@@ -575,11 +618,41 @@ fn render(
         }}, .{ .row_offset = input_row, .col_offset = 0 });
 
         if (input_buffer.items.len > 0) {
-            const max_len: usize = if (width > 2) @as(usize, width) - 2 else 0;
-            const display = if (input_buffer.items.len > max_len)
-                input_buffer.items[input_buffer.items.len - max_len ..]
-            else
-                input_buffer.items;
+            const max_width: usize = if (width > 2) @as(usize, width) - 2 else 0;
+            const current_width = displayWidth(input_buffer.items);
+
+            // 如果显示宽度超过最大宽度，从末尾截取
+            const display = if (current_width > max_width) blk: {
+                // 从末尾向前遍历，找到合适的起始位置
+                var width_from_end: usize = 0;
+                var start: usize = input_buffer.items.len;
+
+                while (start > 0) {
+                    // 找到前一个 UTF-8 字符的起始位置
+                    var char_start = start - 1;
+                    while (char_start > 0 and (input_buffer.items[char_start] & 0xC0) == 0x80) {
+                        char_start -= 1;
+                    }
+
+                    // 解码这个字符
+                    const char_bytes = input_buffer.items[char_start..start];
+                    var iter = unicode.Utf8Iterator{ .bytes = char_bytes, .i = 0 };
+                    const cp = iter.nextCodepoint() orelse break;
+
+                    // 计算字符宽度
+                    const char_width: usize = if ((cp >= 0x4E00 and cp <= 0x9FFF) or
+                        (cp >= 0x3400 and cp <= 0x4DBF) or
+                        (cp >= 0x20000 and cp <= 0x2A6DF) or
+                        (cp >= 0xFF00 and cp <= 0xFFEF) or
+                        (cp >= 0x3000 and cp <= 0x303F)) 2 else 1;
+
+                    if (width_from_end + char_width > max_width) break;
+                    width_from_end += char_width;
+                    start = char_start;
+                }
+
+                break :blk input_buffer.items[start..];
+            } else input_buffer.items;
 
             _ = win.print(&.{.{
                 .text = display,
@@ -587,7 +660,9 @@ fn render(
             }}, .{ .row_offset = input_row, .col_offset = 2 });
         }
 
-        const cursor_col: u16 = @intCast(@min(input_buffer.items.len + 2, width - 1));
+        // 计算光标位置（使用显示宽度而非字节数）
+        const display_len = displayWidth(input_buffer.items);
+        const cursor_col: u16 = @intCast(@min(display_len + 2, width - 1));
         win.showCursor(cursor_col, input_row);
     }
 
