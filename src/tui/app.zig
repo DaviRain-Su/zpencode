@@ -485,20 +485,28 @@ pub fn runAppWithStreaming(
 
                                     thread.join();
 
-                                    // 更新 token 计数
+                                    // 最终渲染 - 确保所有内容都显示
                                     stream_state.mutex.lock();
                                     const final_content = stream_state.content.items;
-                                    total_tokens += (user_input.len + final_content.len) / 4;
+                                    const has_error = stream_state.has_error;
                                     stream_state.mutex.unlock();
 
-                                    if (stream_state.has_error) {
-                                        // 更新为错误消息
-                                        if (messages.items.len > 0) {
-                                            allocator.free(messages.items[messages.items.len - 1].content);
+                                    if (messages.items.len > 0) {
+                                        allocator.free(messages.items[messages.items.len - 1].content);
+                                        if (has_error) {
                                             messages.items[messages.items.len - 1].content = try allocator.dupe(u8, "Error: Streaming failed");
+                                            messages.items[messages.items.len - 1].role = .system;
+                                        } else if (final_content.len > 0) {
+                                            messages.items[messages.items.len - 1].content = try allocator.dupe(u8, final_content);
+                                        } else {
+                                            messages.items[messages.items.len - 1].content = try allocator.dupe(u8, "(No response)");
                                             messages.items[messages.items.len - 1].role = .system;
                                         }
                                     }
+                                    try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
+
+                                    // 更新 token 计数
+                                    total_tokens += (user_input.len + final_content.len) / 4;
                                 } else {
                                     // 非流式模式（原有逻辑）
                                     // 显示 "Thinking..." 提示
