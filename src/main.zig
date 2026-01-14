@@ -16,7 +16,10 @@ var global_config: ?*config.Config = null;
 var global_allocator: std.mem.Allocator = undefined;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const gpa_config = std.heap.GeneralPurposeAllocatorConfig{
+        .stack_trace_frames = 12,
+    };
+    var gpa = std.heap.GeneralPurposeAllocator(gpa_config){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     global_allocator = allocator;
@@ -216,23 +219,28 @@ fn runSimpleMode(allocator: std.mem.Allocator, cfg: *config.Config) !void {
         // 添加用户消息
         try conversation.addMessage(message.Message.init(.user, input));
 
-        // 调用 AI
-        _ = try stdout_file.write("\n< Thinking...\n");
+        // 调用 AI (流式输出)
+        _ = try stdout_file.write("\n< ");
 
-        const response = getAIResponse(allocator, cfg, input) catch |err| {
-            const err_msg = try std.fmt.bufPrint(&out_buf, "< Error: {}\n\n", .{err});
+        var response_text = std.ArrayList(u8).initCapacity(allocator, 1024) catch {
+            _ = try stdout_file.write("Error: Out of memory\n\n");
+            continue;
+        };
+        defer response_text.deinit(allocator);
+
+        const stream_success = getAIResponseStreaming(allocator, cfg, input, &response_text, stdout_file) catch |err| {
+            const err_msg = try std.fmt.bufPrint(&out_buf, "Error: {}\n\n", .{err});
             _ = try stdout_file.write(err_msg);
             continue;
         };
-        defer if (response) |r| allocator.free(r);
 
-        if (response) |r| {
-            try conversation.addMessage(message.Message.init(.assistant, r));
-            _ = try stdout_file.write("< ");
-            _ = try stdout_file.write(r);
+        if (stream_success and response_text.items.len > 0) {
+            // Note: conversation doesn't own the memory, so we don't track it
+            // In a real app, conversation would manage its own memory
+            try conversation.addMessage(message.Message.init(.assistant, response_text.items));
             _ = try stdout_file.write("\n\n");
         } else {
-            _ = try stdout_file.write("< (No response)\n\n");
+            _ = try stdout_file.write("(No response)\n\n");
         }
     }
 }
@@ -261,6 +269,7 @@ fn getAIResponse(allocator: std.mem.Allocator, cfg: *config.Config, user_input: 
                 .model = &lm_interface,
                 .prompt = user_input,
             });
+            defer allocator.free(result.text);
 
             return try allocator.dupe(u8, result.text);
         },
@@ -277,6 +286,7 @@ fn getAIResponse(allocator: std.mem.Allocator, cfg: *config.Config, user_input: 
                 .model = &lm_interface,
                 .prompt = user_input,
             });
+            defer allocator.free(result.text);
 
             return try allocator.dupe(u8, result.text);
         },
@@ -293,6 +303,7 @@ fn getAIResponse(allocator: std.mem.Allocator, cfg: *config.Config, user_input: 
                 .model = &lm_interface,
                 .prompt = user_input,
             });
+            defer allocator.free(result.text);
 
             return try allocator.dupe(u8, result.text);
         },
@@ -310,10 +321,138 @@ fn getAIResponse(allocator: std.mem.Allocator, cfg: *config.Config, user_input: 
                 .model = &lm_interface,
                 .prompt = user_input,
             });
+            defer allocator.free(result.text);
 
             return try allocator.dupe(u8, result.text);
         },
         .custom => return null,
+    }
+}
+
+/// 流式输出 AI 响应
+fn getAIResponseStreaming(
+    allocator: std.mem.Allocator,
+    cfg: *config.Config,
+    user_input: []const u8,
+    response_text: *std.ArrayList(u8),
+    stdout_file: std.fs.File,
+) !bool {
+    const provider_config = cfg.getDefaultProvider() orelse return false;
+
+    // 获取 API key
+    const api_key = provider_config.api_key orelse
+        config.Config.loadApiKeyFromEnv(provider_config.provider_type) orelse {
+        return error.MissingApiKey;
+    };
+
+    // 创建流式回调上下文
+    const StreamContext = struct {
+        response_text: *std.ArrayList(u8),
+        stdout_file: std.fs.File,
+        allocator: std.mem.Allocator,
+        completed: bool = false,
+        has_error: bool = false,
+
+        fn onPart(part: ai.StreamPart, ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (part) {
+                .text_delta => |delta| {
+                    // 直接输出到终端
+                    _ = self.stdout_file.write(delta.text) catch {};
+                    // 同时收集响应文本
+                    self.response_text.appendSlice(self.allocator, delta.text) catch {};
+                },
+                .finish => {
+                    self.completed = true;
+                },
+                else => {},
+            }
+        }
+
+        fn onError(_: anyerror, ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.has_error = true;
+            self.completed = true;
+        }
+
+        fn onComplete(ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.completed = true;
+        }
+    };
+
+    var stream_ctx = StreamContext{
+        .response_text = response_text,
+        .stdout_file = stdout_file,
+        .allocator = allocator,
+    };
+
+    // 使用 ai-zig SDK 流式输出
+    switch (provider_config.provider_type) {
+        .deepseek => {
+            var provider = deepseek.createDeepSeekWithSettings(allocator, .{
+                .api_key = api_key,
+            });
+            defer provider.deinit();
+
+            var model = provider.languageModel(provider_config.model);
+            var lm_interface = model.asLanguageModel();
+
+            const result = ai.streamText(allocator, .{
+                .model = &lm_interface,
+                .prompt = user_input,
+                .callbacks = .{
+                    .on_part = StreamContext.onPart,
+                    .on_error = StreamContext.onError,
+                    .on_complete = StreamContext.onComplete,
+                    .context = &stream_ctx,
+                },
+            }) catch |err| {
+                return err;
+            };
+            defer {
+                result.deinit();
+                allocator.destroy(result);
+            }
+
+            // HTTP streaming is synchronous in our implementation,
+            // so by the time streamText returns, callbacks have already been called
+            return !stream_ctx.has_error;
+        },
+        .anthropic => {
+            // Anthropic 目前使用非流式（回退）
+            const response = try getAIResponse(allocator, cfg, user_input);
+            if (response) |r| {
+                defer allocator.free(r);
+                _ = stdout_file.write(r) catch {};
+                response_text.appendSlice(allocator, r) catch {};
+                return true;
+            }
+            return false;
+        },
+        .openai => {
+            // OpenAI 目前使用非流式（回退）
+            const response = try getAIResponse(allocator, cfg, user_input);
+            if (response) |r| {
+                defer allocator.free(r);
+                _ = stdout_file.write(r) catch {};
+                response_text.appendSlice(allocator, r) catch {};
+                return true;
+            }
+            return false;
+        },
+        .ollama => {
+            // Ollama 目前使用非流式（回退）
+            const response = try getAIResponse(allocator, cfg, user_input);
+            if (response) |r| {
+                defer allocator.free(r);
+                _ = stdout_file.write(r) catch {};
+                response_text.appendSlice(allocator, r) catch {};
+                return true;
+            }
+            return false;
+        },
+        .custom => return false,
     }
 }
 

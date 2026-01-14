@@ -30,6 +30,10 @@ pub fn runSelect(
     title: []const u8,
     options: []const []const u8,
 ) !SelectResult {
+    var vaxis_arena = std.heap.ArenaAllocator.init(allocator);
+    defer vaxis_arena.deinit();
+    const vaxis_allocator = vaxis_arena.allocator();
+
     // 初始化 TTY
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(&tty_buf);
@@ -38,8 +42,8 @@ pub fn runSelect(
     const writer = tty.writer();
 
     // 初始化 Vaxis
-    var vx = try vaxis.init(allocator, .{});
-    defer vx.deinit(allocator, writer);
+    var vx = try vaxis.init(vaxis_allocator, .{});
+    defer vx.deinit(vaxis_allocator, writer);
 
     // 初始化事件循环
     var loop: vaxis.Loop(PromptEvent) = .{
@@ -95,7 +99,7 @@ pub fn runSelect(
                 try renderSelect(&vx, writer, title, options, selected_index);
             },
             .winsize => |ws| {
-                try vx.resize(allocator, writer, ws);
+                try vx.resize(vaxis_allocator, writer, ws);
                 try renderSelect(&vx, writer, title, options, selected_index);
             },
         }
@@ -184,6 +188,10 @@ pub fn runInput(
     title: []const u8,
     is_password: bool,
 ) !InputResult {
+    var vaxis_arena = std.heap.ArenaAllocator.init(allocator);
+    defer vaxis_arena.deinit();
+    const vaxis_allocator = vaxis_arena.allocator();
+
     // 初始化 TTY
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(&tty_buf);
@@ -192,8 +200,8 @@ pub fn runInput(
     const writer = tty.writer();
 
     // 初始化 Vaxis
-    var vx = try vaxis.init(allocator, .{});
-    defer vx.deinit(allocator, writer);
+    var vx = try vaxis.init(vaxis_allocator, .{});
+    defer vx.deinit(vaxis_allocator, writer);
 
     // 初始化事件循环
     var loop: vaxis.Loop(PromptEvent) = .{
@@ -250,7 +258,7 @@ pub fn runInput(
                 try renderInput(&vx, writer, title, &input_buffer, is_password);
             },
             .winsize => |ws| {
-                try vx.resize(allocator, writer, ws);
+                try vx.resize(vaxis_allocator, writer, ws);
                 try renderInput(&vx, writer, title, &input_buffer, is_password);
             },
         }

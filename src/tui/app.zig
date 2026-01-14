@@ -181,6 +181,10 @@ pub fn runApp(
     cfg: *config_mod.Config,
     on_message: *const fn ([]const u8) ?[]const u8,
 ) !void {
+    var vaxis_arena = std.heap.ArenaAllocator.init(allocator);
+    defer vaxis_arena.deinit();
+    const vaxis_allocator = vaxis_arena.allocator();
+
     // TUI 上下文
     var ctx = TuiContext{
         .allocator = allocator,
@@ -196,8 +200,8 @@ pub fn runApp(
     const writer = tty.writer();
 
     // 初始化 Vaxis
-    var vx = try vaxis.init(allocator, .{});
-    defer vx.deinit(allocator, writer);
+    var vx = try vaxis.init(vaxis_allocator, .{});
+    defer vx.deinit(vaxis_allocator, writer);
 
     // 初始化事件循环
     var loop: vaxis.Loop(Event) = .{
@@ -402,7 +406,7 @@ pub fn runApp(
                 }
             },
             .winsize => |ws| {
-                try vx.resize(allocator, writer, ws);
+                try vx.resize(vaxis_allocator, writer, ws);
                 try render(&vx, writer, &messages, &input_buffer);
             },
             else => {},
