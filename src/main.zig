@@ -78,24 +78,7 @@ fn printHelp() void {
 }
 
 fn runTuiMode(allocator: std.mem.Allocator) !void {
-    var app = try tui.App.init(allocator);
-    defer app.deinit();
-
-    // 添加欢迎消息
-    try app.addSystemMessage("Welcome to Zpencode - AI Code Assistant");
-
-    if (global_config) |cfg| {
-        var buf: [128]u8 = undefined;
-        const info = std.fmt.bufPrint(&buf, "Provider: {s} | Model: {s}", .{
-            cfg.default_provider.toString(),
-            if (cfg.getDefaultProvider()) |p| p.model else "unknown",
-        }) catch "Provider info unavailable";
-        try app.addSystemMessage(info);
-    }
-
-    try app.addSystemMessage("Type your message and press Enter. Ctrl+C to exit.");
-
-    try app.run(&onMessageCallback);
+    try tui.runApp(allocator, &onMessageCallback);
 }
 
 fn onMessageCallback(user_input: []const u8) ?[]const u8 {

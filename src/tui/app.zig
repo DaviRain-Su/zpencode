@@ -1,202 +1,172 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
-const message = @import("../models/message.zig");
+const msg_mod = @import("../models/message.zig");
+
+const log = std.log.scoped(.tui);
 
 /// 自定义事件类型
 pub const Event = union(enum) {
     key_press: vaxis.Key,
+    key_release: vaxis.Key,
+    mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
-    // 可以添加更多事件类型
+    focus_in,
+    focus_out,
 };
 
-/// TUI 应用状态
-pub const AppState = enum {
-    running,
-    quitting,
-};
-
-/// 聊天消息显示格式
+/// 聊天消息
 pub const ChatMessage = struct {
-    role: message.Role,
+    role: msg_mod.Role,
     content: []const u8,
-    owned: bool = false, // 是否拥有内容的所有权
-
-    pub fn deinit(self: *ChatMessage, allocator: std.mem.Allocator) void {
-        if (self.owned) {
-            allocator.free(self.content);
-        }
-    }
 };
 
-/// TUI 应用
-pub const App = struct {
-    allocator: std.mem.Allocator,
-    vx: vaxis.Vaxis,
-    tty: vaxis.Tty,
-    loop: vaxis.Loop(Event),
-    state: AppState,
-    messages: std.ArrayList(ChatMessage),
-    input_buffer: std.ArrayList(u8),
-    scroll_offset: usize,
-    tty_buf: [4096]u8,
+/// 运行 TUI 应用
+pub fn runApp(allocator: std.mem.Allocator, on_message: *const fn ([]const u8) ?[]const u8) !void {
+    // 初始化 TTY
+    var tty_buf: [4096]u8 = undefined;
+    var tty = try vaxis.Tty.init(&tty_buf);
+    defer tty.deinit();
 
-    const Self = @This();
+    const writer = tty.writer();
 
-    /// 初始化 TUI 应用
-    pub fn init(allocator: std.mem.Allocator) !Self {
-        // 初始化 TTY
-        var tty_buf: [4096]u8 = undefined;
-        var tty = try vaxis.Tty.init(&tty_buf);
-        errdefer tty.deinit();
+    // 初始化 Vaxis
+    var vx = try vaxis.init(allocator, .{});
+    defer vx.deinit(allocator, writer);
 
-        // 初始化 Vaxis
-        var vx = try vaxis.Vaxis.init(allocator, .{});
-        errdefer vx.deinit(allocator, tty.writer());
+    // 初始化事件循环
+    var loop: vaxis.Loop(Event) = .{
+        .tty = &tty,
+        .vaxis = &vx,
+    };
+    try loop.init();
 
-        // 初始化事件循环
-        var loop: vaxis.Loop(Event) = .{
-            .tty = &tty,
-            .vaxis = &vx,
-        };
-        try loop.init();
+    // 启动事件循环
+    try loop.start();
+    defer loop.stop();
 
-        return .{
-            .allocator = allocator,
-            .vx = vx,
-            .tty = tty,
-            .loop = loop,
-            .state = .running,
-            .messages = .empty,
-            .input_buffer = .empty,
-            .scroll_offset = 0,
-            .tty_buf = tty_buf,
-        };
-    }
+    // 进入 alt screen
+    try vx.enterAltScreen(writer);
 
-    /// 清理资源
-    pub fn deinit(self: *Self) void {
-        // 停止事件循环
-        self.loop.stop();
+    // 刷新
+    try writer.flush();
 
-        // 重置终端状态
-        self.vx.deinit(self.allocator, self.tty.writer());
-        self.tty.deinit();
+    // 查询终端能力
+    try vx.queryTerminal(writer, 1 * std.time.ns_per_s);
 
-        // 清理消息
-        for (self.messages.items) |*msg| {
-            msg.deinit(self.allocator);
+    // 状态
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer {
+        for (messages.items) |msg| {
+            allocator.free(msg.content);
         }
-        self.messages.deinit(self.allocator);
-        self.input_buffer.deinit(self.allocator);
+        messages.deinit(allocator);
     }
 
-    /// 进入 alt screen 模式
-    pub fn start(self: *Self) !void {
-        try self.vx.enterAltScreen(self.tty.writer());
-        try self.vx.queryTerminal(self.tty.writer(), 1_000_000_000);
-        try self.loop.start();
-    }
+    var input_buffer: std.ArrayList(u8) = .empty;
+    defer input_buffer.deinit(allocator);
 
-    /// 处理键盘事件
-    pub fn handleKey(self: *Self, key: vaxis.Key) !?[]const u8 {
-        // Ctrl+C 或 Ctrl+Q 退出
-        if (key.matches('c', .{ .ctrl = true }) or key.matches('q', .{ .ctrl = true })) {
-            self.state = .quitting;
-            return null;
+    // 添加欢迎消息
+    try messages.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "Welcome to Zpencode - AI Code Assistant"),
+    });
+    try messages.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "Type your message and press Enter. Ctrl+C to exit."),
+    });
+
+    // 初始渲染
+    try render(&vx, writer, &messages, &input_buffer);
+
+    // 主事件循环
+    var running = true;
+    while (running) {
+        const event = loop.nextEvent();
+
+        switch (event) {
+            .key_press => |key| {
+                // Ctrl+C 退出
+                if (key.matches('c', .{ .ctrl = true })) {
+                    running = false;
+                    continue;
+                }
+
+                // Enter 发送消息
+                if (key.matches(vaxis.Key.enter, .{})) {
+                    if (input_buffer.items.len > 0) {
+                        const user_input = try allocator.dupe(u8, input_buffer.items);
+                        input_buffer.clearRetainingCapacity();
+
+                        // 添加用户消息
+                        try messages.append(allocator, .{
+                            .role = .user,
+                            .content = user_input,
+                        });
+
+                        try render(&vx, writer, &messages, &input_buffer);
+
+                        // 获取 AI 响应
+                        if (on_message(user_input)) |response| {
+                            try messages.append(allocator, .{
+                                .role = .assistant,
+                                .content = try allocator.dupe(u8, response),
+                            });
+                        } else {
+                            try messages.append(allocator, .{
+                                .role = .system,
+                                .content = try allocator.dupe(u8, "(No response)"),
+                            });
+                        }
+                    }
+                    try render(&vx, writer, &messages, &input_buffer);
+                    continue;
+                }
+
+                // Backspace 删除字符
+                if (key.matches(vaxis.Key.backspace, .{})) {
+                    if (input_buffer.items.len > 0) {
+                        _ = input_buffer.pop();
+                    }
+                    try render(&vx, writer, &messages, &input_buffer);
+                    continue;
+                }
+
+                // 普通字符输入
+                if (key.text) |text| {
+                    try input_buffer.appendSlice(allocator, text);
+                    try render(&vx, writer, &messages, &input_buffer);
+                }
+            },
+            .winsize => |ws| {
+                try vx.resize(allocator, writer, ws);
+                try render(&vx, writer, &messages, &input_buffer);
+            },
+            else => {},
         }
+    }
+}
 
-        // Enter 发送消息
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (self.input_buffer.items.len > 0) {
-                // 复制输入内容
-                const input = try self.allocator.dupe(u8, self.input_buffer.items);
-                self.input_buffer.clearRetainingCapacity();
-                return input;
-            }
-            return null;
-        }
+fn render(
+    vx: *vaxis.Vaxis,
+    writer: *std.Io.Writer,
+    messages: *std.ArrayList(ChatMessage),
+    input_buffer: *std.ArrayList(u8),
+) !void {
+    const win = vx.window();
+    win.clear();
 
-        // Backspace 删除字符
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.input_buffer.items.len > 0) {
-                _ = self.input_buffer.pop();
-            }
-            return null;
-        }
+    const height = win.height;
+    const width = win.width;
 
-        // 处理普通字符输入
-        if (key.text) |text| {
-            try self.input_buffer.appendSlice(self.allocator, text);
-        }
-
-        return null;
+    if (height < 5 or width < 20) {
+        try vx.render(writer);
+        try writer.flush();
+        return;
     }
 
-    /// 添加用户消息
-    pub fn addUserMessage(self: *Self, content: []const u8) !void {
-        const owned_content = try self.allocator.dupe(u8, content);
-        try self.messages.append(self.allocator, .{
-            .role = .user,
-            .content = owned_content,
-            .owned = true,
-        });
-    }
-
-    /// 添加助手消息
-    pub fn addAssistantMessage(self: *Self, content: []const u8) !void {
-        const owned_content = try self.allocator.dupe(u8, content);
-        try self.messages.append(self.allocator, .{
-            .role = .assistant,
-            .content = owned_content,
-            .owned = true,
-        });
-    }
-
-    /// 添加系统消息
-    pub fn addSystemMessage(self: *Self, content: []const u8) !void {
-        const owned_content = try self.allocator.dupe(u8, content);
-        try self.messages.append(self.allocator, .{
-            .role = .system,
-            .content = owned_content,
-            .owned = true,
-        });
-    }
-
-    /// 渲染界面
-    pub fn render(self: *Self) !void {
-        const win = self.vx.window();
-        win.clear();
-
-        // 获取窗口尺寸
-        const height = win.height;
-        const width = win.width;
-
-        if (height < 5 or width < 20) {
-            // 窗口太小
-            return;
-        }
-
-        // 标题栏
-        self.renderTitle(win, width);
-
-        // 消息区域 (留 3 行给输入区)
-        const message_area_height: u16 = if (height > 4) height - 4 else 1;
-        self.renderMessages(win, width, message_area_height);
-
-        // 分隔线
-        self.renderSeparator(win, width, if (height > 3) height - 3 else 1);
-
-        // 输入区域
-        self.renderInput(win, width, if (height > 2) height - 2 else height - 1);
-
-        // 刷新屏幕
-        try self.vx.render(self.tty.writer());
-        try self.tty.writer().flush();
-    }
-
-    fn renderTitle(self: *Self, win: vaxis.Window, width: u16) void {
-        _ = self;
+    // 标题栏
+    {
         const title = " Zpencode - AI Code Assistant ";
         const title_len: u16 = @intCast(title.len);
         const start_x: u16 = if (width > title_len) (width - title_len) / 2 else 0;
@@ -204,25 +174,25 @@ pub const App = struct {
         const segment = vaxis.Segment{
             .text = title,
             .style = .{
-                .fg = .{ .index = 0 }, // Black
-                .bg = .{ .index = 6 }, // Cyan
+                .fg = .{ .index = 0 },
+                .bg = .{ .index = 6 },
                 .bold = true,
             },
         };
-
         _ = win.print(&.{segment}, .{ .col_offset = start_x, .row_offset = 0 });
     }
 
-    fn renderMessages(self: *Self, win: vaxis.Window, width: u16, height: u16) void {
+    // 消息区域
+    {
+        const message_area_height: u16 = if (height > 4) height - 4 else 1;
         var row: u16 = 1;
 
-        // 计算显示起点
-        const total_messages = self.messages.items.len;
-        const max_display: usize = @intCast(height);
-        const start_idx = if (total_messages > max_display) total_messages - max_display else 0;
+        const total = messages.items.len;
+        const max_display: usize = @intCast(message_area_height);
+        const start_idx = if (total > max_display) total - max_display else 0;
 
-        for (self.messages.items[start_idx..]) |msg| {
-            if (row >= height + 1) break;
+        for (messages.items[start_idx..]) |msg| {
+            if (row >= message_area_height + 1) break;
 
             const prefix = switch (msg.role) {
                 .user => "> ",
@@ -231,116 +201,78 @@ pub const App = struct {
             };
 
             const color: vaxis.Color = switch (msg.role) {
-                .user => .{ .index = 2 }, // Green
-                .assistant => .{ .index = 4 }, // Blue
-                else => .{ .index = 7 }, // White
+                .user => .{ .index = 2 },
+                .assistant => .{ .index = 4 },
+                else => .{ .index = 7 },
             };
 
-            // 渲染前缀
-            const prefix_segment = vaxis.Segment{
+            _ = win.print(&.{.{
                 .text = prefix,
                 .style = .{ .fg = color, .bold = true },
-            };
-            _ = win.print(&.{prefix_segment}, .{ .row_offset = row, .col_offset = 0 });
+            }}, .{ .row_offset = row, .col_offset = 0 });
 
-            // 渲染内容 (截断到窗口宽度)
-            const max_content_len: usize = if (width > 2) @as(usize, width) - 2 else @as(usize, width);
-            const display_content = if (msg.content.len > max_content_len)
-                msg.content[0..max_content_len]
-            else
-                msg.content;
+            const max_len: usize = if (width > 2) @as(usize, width) - 2 else @as(usize, width);
+            const content = if (msg.content.len > max_len) msg.content[0..max_len] else msg.content;
 
-            const content_segment = vaxis.Segment{
-                .text = display_content,
+            _ = win.print(&.{.{
+                .text = content,
                 .style = .{ .fg = color },
-            };
-            _ = win.print(&.{content_segment}, .{ .row_offset = row, .col_offset = 2 });
+            }}, .{ .row_offset = row, .col_offset = 2 });
 
             row += 1;
         }
     }
 
-    fn renderSeparator(self: *Self, win: vaxis.Window, width: u16, row: u16) void {
-        _ = self;
+    // 分隔线
+    {
+        const sep_row: u16 = if (height > 3) height - 3 else 1;
         var i: u16 = 0;
         while (i < width) : (i += 1) {
-            win.writeCell(i, row, .{
+            win.writeCell(i, sep_row, .{
                 .char = .{ .grapheme = "─", .width = 1 },
-                .style = .{ .fg = .{ .index = 8 } }, // Gray
+                .style = .{ .fg = .{ .index = 8 } },
             });
         }
     }
 
-    fn renderInput(self: *Self, win: vaxis.Window, width: u16, row: u16) void {
-        // 渲染提示符
-        const prompt_segment = vaxis.Segment{
+    // 输入区域
+    {
+        const input_row: u16 = if (height > 2) height - 2 else height - 1;
+
+        _ = win.print(&.{.{
             .text = "> ",
-            .style = .{ .fg = .{ .index = 3 }, .bold = true }, // Yellow
-        };
-        _ = win.print(&.{prompt_segment}, .{ .row_offset = row, .col_offset = 0 });
+            .style = .{ .fg = .{ .index = 3 }, .bold = true },
+        }}, .{ .row_offset = input_row, .col_offset = 0 });
 
-        // 渲染输入内容
-        const max_input_len: usize = if (width > 2) @as(usize, width) - 2 else 0;
-        if (self.input_buffer.items.len > 0) {
-            const display_input = if (self.input_buffer.items.len > max_input_len)
-                self.input_buffer.items[self.input_buffer.items.len - max_input_len ..]
+        if (input_buffer.items.len > 0) {
+            const max_len: usize = if (width > 2) @as(usize, width) - 2 else 0;
+            const display = if (input_buffer.items.len > max_len)
+                input_buffer.items[input_buffer.items.len - max_len ..]
             else
-                self.input_buffer.items;
+                input_buffer.items;
 
-            const input_segment = vaxis.Segment{
-                .text = display_input,
+            _ = win.print(&.{.{
+                .text = display,
                 .style = .{},
-            };
-            _ = win.print(&.{input_segment}, .{ .row_offset = row, .col_offset = 2 });
+            }}, .{ .row_offset = input_row, .col_offset = 2 });
         }
 
-        // 显示光标位置
-        const cursor_col: u16 = @intCast(@min(self.input_buffer.items.len + 2, width - 1));
-        win.showCursor(cursor_col, row);
+        const cursor_col: u16 = @intCast(@min(input_buffer.items.len + 2, width - 1));
+        win.showCursor(cursor_col, input_row);
     }
 
-    /// 运行事件循环
-    pub fn run(self: *Self, on_message: *const fn ([]const u8) ?[]const u8) !void {
-        try self.start();
+    try vx.render(writer);
+    try writer.flush();
+}
 
-        while (self.state == .running) {
-            // 等待事件
-            const event = self.loop.nextEvent();
-
-            switch (event) {
-                .key_press => |key| {
-                    if (try self.handleKey(key)) |user_input| {
-                        defer self.allocator.free(user_input);
-
-                        // 添加用户消息
-                        try self.addUserMessage(user_input);
-                        try self.render();
-
-                        // 获取 AI 响应
-                        if (on_message(user_input)) |response| {
-                            try self.addAssistantMessage(response);
-                        }
-                    }
-                },
-                .winsize => |ws| {
-                    try self.vx.resize(self.allocator, self.tty.writer(), ws);
-                },
-            }
-
-            try self.render();
-        }
+// 导出用于 root.zig
+pub const App = struct {
+    pub fn init(_: std.mem.Allocator) !App {
+        return .{};
     }
+    pub fn deinit(_: *App) void {}
 };
 
-/// 创建并运行 TUI 应用
-pub fn runApp(allocator: std.mem.Allocator, on_message: *const fn ([]const u8) ?[]const u8) !void {
-    var app = try App.init(allocator);
-    defer app.deinit();
+pub const AppState = enum { running, quitting };
 
-    try app.run(on_message);
-}
-
-test "app initialization" {
-    // 测试只验证编译，不实际运行 TUI
-    // 因为 TUI 需要真实终端
-}
+test "compile check" {}
