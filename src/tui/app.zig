@@ -69,11 +69,56 @@ pub const ChatMessage = struct {
     content: []const u8,
 };
 
+/// 流式响应状态
+pub const StreamingState = struct {
+    allocator: std.mem.Allocator,
+    is_streaming: bool = false,
+    content: std.ArrayList(u8) = .empty,
+    completed: bool = false,
+    has_error: bool = false,
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn init(alloc: std.mem.Allocator) StreamingState {
+        return .{
+            .allocator = alloc,
+        };
+    }
+
+    pub fn deinit(self: *StreamingState) void {
+        self.content.deinit(self.allocator);
+    }
+
+    pub fn reset(self: *StreamingState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.content.clearRetainingCapacity();
+        self.is_streaming = false;
+        self.completed = false;
+        self.has_error = false;
+    }
+
+    pub fn appendChunk(self: *StreamingState, chunk: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.content.appendSlice(self.allocator, chunk) catch {};
+    }
+
+    pub fn getContent(self: *StreamingState) []const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.content.items;
+    }
+};
+
+/// 流式回调函数类型
+pub const StreamCallback = *const fn (user_input: []const u8, state: *StreamingState) void;
+
 /// TUI 上下文
 pub const TuiContext = struct {
     allocator: std.mem.Allocator,
     config: *config_mod.Config,
     on_message: *const fn ([]const u8) ?[]const u8,
+    on_message_stream: ?StreamCallback = null, // 可选的流式回调
 };
 
 /// 状态栏信息
@@ -234,6 +279,16 @@ pub fn runApp(
     cfg: *config_mod.Config,
     on_message: *const fn ([]const u8) ?[]const u8,
 ) !void {
+    return runAppWithStreaming(allocator, cfg, on_message, null);
+}
+
+/// 带流式回调的 TUI 应用
+pub fn runAppWithStreaming(
+    allocator: std.mem.Allocator,
+    cfg: *config_mod.Config,
+    on_message: *const fn ([]const u8) ?[]const u8,
+    on_message_stream: ?StreamCallback,
+) !void {
     var vaxis_arena = std.heap.ArenaAllocator.init(allocator);
     defer vaxis_arena.deinit();
     const vaxis_allocator = vaxis_arena.allocator();
@@ -243,6 +298,7 @@ pub fn runApp(
         .allocator = allocator,
         .config = cfg,
         .on_message = on_message,
+        .on_message_stream = on_message_stream,
     };
 
     // 初始化 TTY
@@ -252,9 +308,17 @@ pub fn runApp(
 
     const writer = tty.writer();
 
-    // 初始化 Vaxis（启用 paste allocator 支持粘贴和 IME）
+    // 初始化 Vaxis（禁用 kitty keyboard 协议以改善 IME 兼容性）
     var vx = try vaxis.init(vaxis_allocator, .{
         .system_clipboard_allocator = allocator,
+        // 禁用 kitty keyboard 增强功能，改善 IME（中文输入法）兼容性
+        .kitty_keyboard_flags = .{
+            .disambiguate = false,
+            .report_events = false,
+            .report_alternate_keys = false,
+            .report_all_as_ctl_seqs = false,
+            .report_text = false,
+        },
     });
     defer vx.deinit(vaxis_allocator, writer);
 
@@ -361,44 +425,120 @@ pub fn runApp(
                                     .content = user_input,
                                 });
 
-                                // 显示 "Thinking..." 提示
-                                try messages.append(allocator, .{
-                                    .role = .system,
-                                    .content = try allocator.dupe(u8, "⏳ Thinking..."),
-                                });
-                                try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
+                                // 检查是否有流式回调
+                                if (ctx.on_message_stream) |stream_callback| {
+                                    // 流式输出模式
+                                    var stream_state = StreamingState.init(allocator);
+                                    defer stream_state.deinit();
 
-                                // 获取 AI 响应
-                                const ai_response = on_message(user_input);
+                                    // 添加空的 AI 响应占位
+                                    try messages.append(allocator, .{
+                                        .role = .assistant,
+                                        .content = try allocator.dupe(u8, "▌"),
+                                    });
 
-                                // 移除 "Thinking..." 消息
-                                if (messages.items.len > 0) {
-                                    if (messages.pop()) |last| {
-                                        allocator.free(last.content);
+                                    // 在后台线程中调用流式回调
+                                    stream_state.is_streaming = true;
+                                    const thread = try std.Thread.spawn(.{}, struct {
+                                        fn run(cb: StreamCallback, input: []const u8, state: *StreamingState) void {
+                                            cb(input, state);
+                                            state.mutex.lock();
+                                            state.completed = true;
+                                            state.is_streaming = false;
+                                            state.mutex.unlock();
+                                        }
+                                    }.run, .{ stream_callback, user_input, &stream_state });
+
+                                    // 轮询更新显示
+                                    var last_len: usize = 0;
+                                    while (true) {
+                                        stream_state.mutex.lock();
+                                        const current_content = stream_state.content.items;
+                                        const completed = stream_state.completed;
+                                        stream_state.mutex.unlock();
+
+                                        // 更新显示
+                                        if (current_content.len > last_len or completed) {
+                                            // 更新最后一条消息
+                                            if (messages.items.len > 0) {
+                                                allocator.free(messages.items[messages.items.len - 1].content);
+                                                if (completed and current_content.len > 0) {
+                                                    messages.items[messages.items.len - 1].content = try allocator.dupe(u8, current_content);
+                                                } else if (current_content.len > 0) {
+                                                    // 添加光标指示符
+                                                    const display = try std.fmt.allocPrint(allocator, "{s}▌", .{current_content});
+                                                    messages.items[messages.items.len - 1].content = display;
+                                                } else {
+                                                    messages.items[messages.items.len - 1].content = try allocator.dupe(u8, "▌");
+                                                }
+                                            }
+                                            try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
+                                            last_len = current_content.len;
+                                        }
+
+                                        if (completed) break;
+
+                                        // 短暂休眠避免忙等待
+                                        std.Thread.sleep(50 * std.time.ns_per_ms);
                                     }
-                                }
 
-                                // 显示 AI 响应或错误
-                                if (ai_response) |response| {
-                                    defer allocator.free(response); // 释放回调返回的内存
-                                    if (response.len > 0) {
-                                        try messages.append(allocator, .{
-                                            .role = .assistant,
-                                            .content = try allocator.dupe(u8, response),
-                                        });
-                                        // 更新 token 计数（粗略估计：用户输入 + AI 响应）
-                                        total_tokens += (user_input.len + response.len) / 4;
+                                    thread.join();
+
+                                    // 更新 token 计数
+                                    stream_state.mutex.lock();
+                                    const final_content = stream_state.content.items;
+                                    total_tokens += (user_input.len + final_content.len) / 4;
+                                    stream_state.mutex.unlock();
+
+                                    if (stream_state.has_error) {
+                                        // 更新为错误消息
+                                        if (messages.items.len > 0) {
+                                            allocator.free(messages.items[messages.items.len - 1].content);
+                                            messages.items[messages.items.len - 1].content = try allocator.dupe(u8, "Error: Streaming failed");
+                                            messages.items[messages.items.len - 1].role = .system;
+                                        }
+                                    }
+                                } else {
+                                    // 非流式模式（原有逻辑）
+                                    // 显示 "Thinking..." 提示
+                                    try messages.append(allocator, .{
+                                        .role = .system,
+                                        .content = try allocator.dupe(u8, "⏳ Thinking..."),
+                                    });
+                                    try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
+
+                                    // 获取 AI 响应
+                                    const ai_response = on_message(user_input);
+
+                                    // 移除 "Thinking..." 消息
+                                    if (messages.items.len > 0) {
+                                        if (messages.pop()) |last| {
+                                            allocator.free(last.content);
+                                        }
+                                    }
+
+                                    // 显示 AI 响应或错误
+                                    if (ai_response) |response| {
+                                        defer allocator.free(response); // 释放回调返回的内存
+                                        if (response.len > 0) {
+                                            try messages.append(allocator, .{
+                                                .role = .assistant,
+                                                .content = try allocator.dupe(u8, response),
+                                            });
+                                            // 更新 token 计数（粗略估计：用户输入 + AI 响应）
+                                            total_tokens += (user_input.len + response.len) / 4;
+                                        } else {
+                                            try messages.append(allocator, .{
+                                                .role = .system,
+                                                .content = try allocator.dupe(u8, "Error: Empty response from AI"),
+                                            });
+                                        }
                                     } else {
                                         try messages.append(allocator, .{
                                             .role = .system,
-                                            .content = try allocator.dupe(u8, "Error: Empty response from AI"),
+                                            .content = try allocator.dupe(u8, "Error: No response (check API key)"),
                                         });
                                     }
-                                } else {
-                                    try messages.append(allocator, .{
-                                        .role = .system,
-                                        .content = try allocator.dupe(u8, "Error: No response (check API key)"),
-                                    });
                                 }
                             },
                             .handled => {

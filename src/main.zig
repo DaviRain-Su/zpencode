@@ -114,7 +114,8 @@ fn printHelp() void {
 }
 
 fn runTuiMode(allocator: std.mem.Allocator, cfg: *config.Config) !void {
-    try tui.runApp(allocator, cfg, &onMessageCallback);
+    // 使用流式回调的 TUI 模式
+    try tui.runAppWithStreaming(allocator, cfg, &onMessageCallback, &onMessageStreamCallback);
 }
 
 fn onMessageCallback(user_input: []const u8) ?[]const u8 {
@@ -123,6 +124,102 @@ fn onMessageCallback(user_input: []const u8) ?[]const u8 {
         // 返回错误信息给用户显示
         return std.fmt.allocPrint(global_allocator, "[Error: {s}]", .{@errorName(err)}) catch null;
     };
+}
+
+/// 流式消息回调 - 用于 TUI 模式的实时输出
+fn onMessageStreamCallback(user_input: []const u8, state: *tui.StreamingState) void {
+    const cfg = global_config orelse {
+        state.has_error = true;
+        return;
+    };
+
+    const provider_config = cfg.getDefaultProvider() orelse {
+        state.has_error = true;
+        return;
+    };
+
+    // 获取 API key
+    const api_key = provider_config.api_key orelse
+        config.Config.loadApiKeyFromEnv(provider_config.provider_type) orelse {
+        state.has_error = true;
+        return;
+    };
+
+    // 使用流式 API
+    switch (provider_config.provider_type) {
+        .deepseek => {
+            var provider = deepseek.createDeepSeekWithSettings(global_allocator, .{
+                .api_key = api_key,
+            });
+            defer provider.deinit();
+
+            var model = provider.languageModel(provider_config.model);
+            var lm_interface = model.asLanguageModel();
+
+            const StreamContext = struct {
+                state: *tui.StreamingState,
+
+                fn onPart(part: ai.StreamPart, ctx: ?*anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    switch (part) {
+                        .text_delta => |delta| {
+                            self.state.appendChunk(delta.text);
+                        },
+                        .finish => {},
+                        else => {},
+                    }
+                }
+
+                fn onError(_: anyerror, ctx: ?*anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    self.state.mutex.lock();
+                    self.state.has_error = true;
+                    self.state.mutex.unlock();
+                }
+
+                fn onComplete(_: ?*anyopaque) void {}
+            };
+
+            var stream_ctx = StreamContext{ .state = state };
+
+            const result = ai.streamText(global_allocator, .{
+                .model = &lm_interface,
+                .prompt = user_input,
+                .callbacks = .{
+                    .on_part = StreamContext.onPart,
+                    .on_error = StreamContext.onError,
+                    .on_complete = StreamContext.onComplete,
+                    .context = &stream_ctx,
+                },
+            }) catch {
+                state.mutex.lock();
+                state.has_error = true;
+                state.mutex.unlock();
+                return;
+            };
+            defer {
+                result.deinit();
+                global_allocator.destroy(result);
+            }
+        },
+        else => {
+            // 其他 provider 回退到非流式
+            const response = getAIResponse(global_allocator, cfg, user_input) catch {
+                state.mutex.lock();
+                state.has_error = true;
+                state.mutex.unlock();
+                return;
+            };
+            if (response) |r| {
+                state.appendChunk(r);
+                global_allocator.free(r);
+            } else {
+                state.mutex.lock();
+                state.has_error = true;
+                state.mutex.unlock();
+            }
+        },
+    }
 }
 
 fn runSimpleMode(allocator: std.mem.Allocator, cfg: *config.Config) !void {
