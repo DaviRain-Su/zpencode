@@ -29,6 +29,7 @@ pub const ProviderType = enum {
 pub const ProviderConfig = struct {
     provider_type: ProviderType,
     api_key: ?[]const u8 = null,
+    api_key_owned: bool = false, // 是否需要释放 api_key
     base_url: []const u8,
     model: []const u8,
     max_tokens: u32 = 8192,
@@ -63,6 +64,15 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config) void {
+        // 释放已分配的 API keys
+        var iter = self.providers.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.api_key_owned) {
+                if (entry.value_ptr.api_key) |key| {
+                    self.allocator.free(key);
+                }
+            }
+        }
         self.providers.deinit();
         self.allowed_paths.deinit(self.allocator);
         self.denied_paths.deinit(self.allocator);
@@ -103,6 +113,26 @@ pub const Config = struct {
     /// Get the default provider config
     pub fn getDefaultProvider(self: *const Config) ?ProviderConfig {
         return self.providers.get(self.default_provider.toString());
+    }
+
+    /// Set API key for a provider
+    pub fn setApiKey(self: *Config, provider_name: []const u8, api_key: []const u8) !void {
+        if (self.providers.getPtr(provider_name)) |cfg| {
+            // 如果之前有 key，先释放
+            if (cfg.api_key) |old_key| {
+                // 只释放我们分配的 key，不释放环境变量的
+                if (cfg.api_key_owned) {
+                    self.allocator.free(old_key);
+                }
+            }
+            cfg.api_key = try self.allocator.dupe(u8, api_key);
+            cfg.api_key_owned = true;
+        }
+    }
+
+    /// Set API key for default provider
+    pub fn setDefaultApiKey(self: *Config, api_key: []const u8) !void {
+        try self.setApiKey(self.default_provider.toString(), api_key);
     }
 
     /// Load API key from environment variable

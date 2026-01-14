@@ -64,12 +64,14 @@ fn handleCommand(
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "?")) {
         return .{ .message = try allocator.dupe(u8,
             \\Commands:
-            \\  /help, /h, /?     - Show this help
-            \\  /provider, /p     - Show current provider
-            \\  /provider <name>  - Switch provider (anthropic/openai/ollama)
-            \\  /model            - Show current model
-            \\  /clear, /c        - Clear messages
-            \\  /quit, /q         - Exit
+            \\  /help, /h, /?           - Show this help
+            \\  /provider, /p           - Show current provider
+            \\  /provider <name>        - Switch provider (anthropic/openai/ollama)
+            \\  /apikey <key>           - Set API key for current provider
+            \\  /apikey <provider> <key> - Set API key for specific provider
+            \\  /model                  - Show current model
+            \\  /clear, /c              - Clear messages
+            \\  /quit, /q               - Exit
         ) };
     }
 
@@ -106,6 +108,48 @@ fn handleCommand(
         };
         return .{ .message = try std.fmt.allocPrint(allocator,
             "Model: {s}\nProvider: {s}", .{ cfg.model, ctx.config.default_provider.toString() }) };
+    }
+
+    if (std.mem.eql(u8, cmd, "apikey") or std.mem.eql(u8, cmd, "key") or std.mem.eql(u8, cmd, "k")) {
+        if (arg) |first_arg| {
+            // 检查是否有第二个参数
+            const second_arg = iter.next();
+
+            if (second_arg) |api_key| {
+                // /apikey <provider> <key> - 设置指定 provider 的 key
+                if (config_mod.ProviderType.fromString(first_arg)) |_| {
+                    ctx.config.setApiKey(first_arg, api_key) catch {
+                        return .{ .message = try std.fmt.allocPrint(allocator,
+                            "Failed to set API key for {s}", .{first_arg}) };
+                    };
+                    return .{ .message = try std.fmt.allocPrint(allocator,
+                        "API key set for {s}", .{first_arg}) };
+                } else {
+                    return .{ .message = try allocator.dupe(u8,
+                        "Unknown provider. Use: /apikey <provider> <key>") };
+                }
+            } else {
+                // /apikey <key> - 设置当前 provider 的 key
+                ctx.config.setDefaultApiKey(first_arg) catch {
+                    return .{ .message = try allocator.dupe(u8, "Failed to set API key") };
+                };
+                return .{ .message = try std.fmt.allocPrint(allocator,
+                    "API key set for {s}", .{ctx.config.default_provider.toString()}) };
+            }
+        } else {
+            // 显示当前 API key 状态
+            const provider_name = ctx.config.default_provider.toString();
+            const has_key = blk: {
+                if (ctx.config.getDefaultProvider()) |cfg| {
+                    if (cfg.api_key != null) break :blk true;
+                }
+                if (config_mod.Config.loadApiKeyFromEnv(ctx.config.default_provider) != null) break :blk true;
+                break :blk false;
+            };
+            const status = if (has_key) "configured" else "not set";
+            return .{ .message = try std.fmt.allocPrint(allocator,
+                "API key for {s}: {s}\nUsage: /apikey <key> or /apikey <provider> <key>", .{ provider_name, status }) };
+        }
     }
 
     return .{ .message = try std.fmt.allocPrint(allocator,
