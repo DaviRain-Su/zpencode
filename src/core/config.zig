@@ -4,6 +4,7 @@ const std = @import("std");
 pub const ProviderType = enum {
     anthropic,
     openai,
+    deepseek,
     ollama,
     custom,
 
@@ -11,6 +12,7 @@ pub const ProviderType = enum {
         return switch (self) {
             .anthropic => "anthropic",
             .openai => "openai",
+            .deepseek => "deepseek",
             .ollama => "ollama",
             .custom => "custom",
         };
@@ -19,6 +21,7 @@ pub const ProviderType = enum {
     pub fn fromString(s: []const u8) ?ProviderType {
         if (std.mem.eql(u8, s, "anthropic")) return .anthropic;
         if (std.mem.eql(u8, s, "openai")) return .openai;
+        if (std.mem.eql(u8, s, "deepseek")) return .deepseek;
         if (std.mem.eql(u8, s, "ollama")) return .ollama;
         if (std.mem.eql(u8, s, "custom")) return .custom;
         return null;
@@ -96,6 +99,14 @@ pub const Config = struct {
             .max_tokens = 8192,
         });
 
+        // Add default DeepSeek provider
+        try self.providers.put("deepseek", .{
+            .provider_type = .deepseek,
+            .base_url = "https://api.deepseek.com/v1",
+            .model = "deepseek-chat",
+            .max_tokens = 8192,
+        });
+
         // Add default Ollama provider (local)
         try self.providers.put("ollama", .{
             .provider_type = .ollama,
@@ -140,6 +151,7 @@ pub const Config = struct {
         const env_var = switch (provider_type) {
             .anthropic => "ANTHROPIC_API_KEY",
             .openai => "OPENAI_API_KEY",
+            .deepseek => "DEEPSEEK_API_KEY",
             .ollama => null,
             .custom => null,
         };
@@ -148,6 +160,144 @@ pub const Config = struct {
             return std.posix.getenv(var_name);
         }
         return null;
+    }
+
+    /// 递归释放 JSON Value
+    fn freeJsonValue(allocator: std.mem.Allocator, value: *std.json.Value) void {
+        switch (value.*) {
+            .object => |*obj| {
+                var iter = obj.iterator();
+                while (iter.next()) |entry| {
+                    freeJsonValue(allocator, entry.value_ptr);
+                }
+                obj.deinit();
+            },
+            .array => |*arr| {
+                for (arr.items) |*item| {
+                    freeJsonValue(allocator, item);
+                }
+                arr.deinit();
+            },
+            else => {},
+        }
+    }
+
+    /// Save configuration to file
+    pub fn saveToFile(self: *const Config) !void {
+        const config_path = try getConfigPath(self.allocator);
+        defer self.allocator.free(config_path);
+
+        // Ensure config directory exists
+        const dir_path = std.fs.path.dirname(config_path) orelse return error.InvalidPath;
+        std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        // Build JSON object
+        const json_obj = std.json.ObjectMap.init(self.allocator);
+        var json_value = std.json.Value{ .object = json_obj };
+        defer freeJsonValue(self.allocator, &json_value);
+
+        // Save default provider
+        try json_value.object.put("default_provider", .{ .string = self.default_provider.toString() });
+
+        // Save provider configs with API keys
+        var providers_obj = std.json.ObjectMap.init(self.allocator);
+
+        var iter = self.providers.iterator();
+        while (iter.next()) |entry| {
+            var provider_obj = std.json.ObjectMap.init(self.allocator);
+
+            const cfg = entry.value_ptr.*;
+            try provider_obj.put("model", .{ .string = cfg.model });
+            try provider_obj.put("base_url", .{ .string = cfg.base_url });
+            try provider_obj.put("max_tokens", .{ .integer = @intCast(cfg.max_tokens) });
+
+            // Only save API key if it's owned (user-configured, not from env)
+            if (cfg.api_key_owned) {
+                if (cfg.api_key) |key| {
+                    try provider_obj.put("api_key", .{ .string = key });
+                }
+            }
+
+            try providers_obj.put(entry.key_ptr.*, .{ .object = provider_obj });
+        }
+
+        try json_value.object.put("providers", .{ .object = providers_obj });
+
+        // Write to file
+        const file = try std.fs.createFileAbsolute(config_path, .{});
+        defer file.close();
+
+        // Serialize JSON value
+        const json_str = try std.json.Stringify.valueAlloc(self.allocator, json_value, .{ .whitespace = .indent_2 });
+        defer self.allocator.free(json_str);
+
+        _ = try file.write(json_str);
+    }
+
+    /// Load configuration from file
+    pub fn loadFromFile(self: *Config) !bool {
+        const config_path = try getConfigPath(self.allocator);
+        defer self.allocator.free(config_path);
+
+        const file = std.fs.openFileAbsolute(config_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer file.close();
+
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        defer self.allocator.free(content);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, content, .{}) catch {
+            return false;
+        };
+        defer parsed.deinit();
+
+        const root = parsed.value;
+
+        // Load default provider
+        if (root.object.get("default_provider")) |dp| {
+            if (dp == .string) {
+                if (ProviderType.fromString(dp.string)) |pt| {
+                    self.default_provider = pt;
+                }
+            }
+        }
+
+        // Load provider configs
+        if (root.object.get("providers")) |providers| {
+            if (providers == .object) {
+                var piter = providers.object.iterator();
+                while (piter.next()) |entry| {
+                    const provider_name = entry.key_ptr.*;
+                    const provider_config = entry.value_ptr.*;
+
+                    if (provider_config == .object) {
+                        // Get or create provider config
+                        if (self.providers.getPtr(provider_name)) |cfg| {
+                            // Update existing provider config
+                            if (provider_config.object.get("api_key")) |key| {
+                                if (key == .string) {
+                                    // Free old key if owned
+                                    if (cfg.api_key_owned) {
+                                        if (cfg.api_key) |old_key| {
+                                            self.allocator.free(old_key);
+                                        }
+                                    }
+                                    cfg.api_key = try self.allocator.dupe(u8, key.string);
+                                    cfg.api_key_owned = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return true;
     }
 };
 

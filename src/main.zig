@@ -3,11 +3,13 @@ const vaxis = @import("vaxis");
 const ai = @import("ai");
 const anthropic = @import("anthropic");
 const openai = @import("openai");
+const deepseek = @import("deepseek");
 
 const zpencode = @import("zpencode");
 const config = zpencode.config;
 const message = zpencode.message;
 const tui = zpencode.tui;
+const prompt = zpencode.prompt;
 
 /// 全局配置
 var global_config: ?*config.Config = null;
@@ -23,7 +25,22 @@ pub fn main() !void {
     var cfg = config.Config.init(allocator);
     defer cfg.deinit();
     try cfg.loadDefaults();
+
+    // 从配置文件加载（覆盖默认值）
+    const config_loaded = cfg.loadFromFile() catch false;
+
     global_config = &cfg;
+
+    // 检查是否需要首次配置（没有配置文件且没有环境变量中的 API key）
+    const needs_setup = blk: {
+        if (config_loaded) break :blk false;
+        // 检查是否有可用的 API key（配置文件或环境变量）
+        if (cfg.getDefaultProvider()) |pcfg| {
+            if (pcfg.api_key != null) break :blk false;
+            if (config.Config.loadApiKeyFromEnv(pcfg.provider_type) != null) break :blk false;
+        }
+        break :blk true;
+    };
 
     // 解析命令行参数
     const args = try std.process.argsAlloc(allocator);
@@ -37,6 +54,22 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
+        }
+    }
+
+    // 首次运行时显示配置向导
+    if (needs_setup and !use_simple_mode) {
+        const stdout = std.fs.File.stdout();
+        _ = stdout.write("\n  Welcome to Zpencode! Let's configure your AI provider.\n\n") catch {};
+
+        const wizard_success = prompt.runConfigWizard(allocator, &cfg) catch |err| blk: {
+            std.log.warn("Config wizard failed: {}", .{err});
+            break :blk false;
+        };
+
+        if (!wizard_success) {
+            _ = stdout.write("\n  Setup cancelled. You can run /config later to configure.\n") catch {};
+            _ = stdout.write("  Or set ANTHROPIC_API_KEY / OPENAI_API_KEY environment variable.\n\n") catch {};
         }
     }
 
@@ -84,8 +117,8 @@ fn runTuiMode(allocator: std.mem.Allocator, cfg: *config.Config) !void {
 fn onMessageCallback(user_input: []const u8) ?[]const u8 {
     const cfg = global_config orelse return null;
     return getAIResponse(global_allocator, cfg, user_input) catch |err| {
-        std.log.err("AI Error: {}", .{err});
-        return null;
+        // 返回错误信息给用户显示
+        return std.fmt.allocPrint(global_allocator, "[Error: {s}]", .{@errorName(err)}) catch null;
     };
 }
 
@@ -233,6 +266,22 @@ fn getAIResponse(allocator: std.mem.Allocator, cfg: *config.Config, user_input: 
         },
         .openai => {
             var provider = openai.createOpenAIWithSettings(allocator, .{
+                .api_key = api_key,
+            });
+            defer provider.deinit();
+
+            var model = provider.languageModel(provider_config.model);
+            var lm_interface = model.asLanguageModel();
+
+            const result = try ai.generateText(allocator, .{
+                .model = &lm_interface,
+                .prompt = user_input,
+            });
+
+            return try allocator.dupe(u8, result.text);
+        },
+        .deepseek => {
+            var provider = deepseek.createDeepSeekWithSettings(allocator, .{
                 .api_key = api_key,
             });
             defer provider.deinit();

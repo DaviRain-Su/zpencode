@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 
 const msg_mod = @import("../models/message.zig");
 const config_mod = @import("../core/config.zig");
+const prompt = @import("prompt.zig");
 
 const log = std.log.scoped(.tui);
 
@@ -35,6 +36,7 @@ const CommandResult = union(enum) {
     handled, // 命令已处理
     quit, // 退出
     clear, // 清空消息
+    config_wizard, // 启动配置向导
     message: []const u8, // 显示消息
 };
 
@@ -65,14 +67,19 @@ fn handleCommand(
         return .{ .message = try allocator.dupe(u8,
             \\Commands:
             \\  /help, /h, /?           - Show this help
+            \\  /config                 - Run interactive configuration wizard
             \\  /provider, /p           - Show current provider
-            \\  /provider <name>        - Switch provider (anthropic/openai/ollama)
+            \\  /provider <name>        - Switch provider (anthropic/openai/deepseek/ollama)
             \\  /apikey <key>           - Set API key for current provider
             \\  /apikey <provider> <key> - Set API key for specific provider
             \\  /model                  - Show current model
             \\  /clear, /c              - Clear messages
             \\  /quit, /q               - Exit
         ) };
+    }
+
+    if (std.mem.eql(u8, cmd, "config")) {
+        return .config_wizard;
     }
 
     if (std.mem.eql(u8, cmd, "provider") or std.mem.eql(u8, cmd, "p")) {
@@ -82,16 +89,20 @@ fn handleCommand(
                 // 检查是否有这个 provider 的配置
                 if (ctx.config.getProvider(provider_name) != null) {
                     ctx.config.default_provider = new_provider;
+                    // 保存到配置文件
+                    ctx.config.saveToFile() catch |err| {
+                        log.warn("Failed to save config: {}", .{err});
+                    };
                     const new_cfg = ctx.config.getDefaultProvider().?;
                     return .{ .message = try std.fmt.allocPrint(allocator,
-                        "Switched to {s} ({s})", .{ provider_name, new_cfg.model }) };
+                        "Switched to {s} ({s}) (saved)", .{ provider_name, new_cfg.model }) };
                 } else {
                     return .{ .message = try std.fmt.allocPrint(allocator,
                         "Provider '{s}' not configured", .{provider_name}) };
                 }
             } else {
                 return .{ .message = try allocator.dupe(u8,
-                    "Unknown provider. Available: anthropic, openai, ollama") };
+                    "Unknown provider. Available: anthropic, openai, deepseek, ollama") };
             }
         } else {
             // 显示当前 provider
@@ -122,8 +133,12 @@ fn handleCommand(
                         return .{ .message = try std.fmt.allocPrint(allocator,
                             "Failed to set API key for {s}", .{first_arg}) };
                     };
+                    // 保存到配置文件
+                    ctx.config.saveToFile() catch |err| {
+                        log.warn("Failed to save config: {}", .{err});
+                    };
                     return .{ .message = try std.fmt.allocPrint(allocator,
-                        "API key set for {s}", .{first_arg}) };
+                        "API key set for {s} (saved)", .{first_arg}) };
                 } else {
                     return .{ .message = try allocator.dupe(u8,
                         "Unknown provider. Use: /apikey <provider> <key>") };
@@ -133,8 +148,12 @@ fn handleCommand(
                 ctx.config.setDefaultApiKey(first_arg) catch {
                     return .{ .message = try allocator.dupe(u8, "Failed to set API key") };
                 };
+                // 保存到配置文件
+                ctx.config.saveToFile() catch |err| {
+                    log.warn("Failed to save config: {}", .{err});
+                };
                 return .{ .message = try std.fmt.allocPrint(allocator,
-                    "API key set for {s}", .{ctx.config.default_provider.toString()}) };
+                    "API key set for {s} (saved)", .{ctx.config.default_provider.toString()}) };
             }
         } else {
             // 显示当前 API key 状态
@@ -266,14 +285,37 @@ pub fn runApp(
                                     .content = user_input,
                                 });
 
+                                // 显示 "Thinking..." 提示
+                                try messages.append(allocator, .{
+                                    .role = .system,
+                                    .content = try allocator.dupe(u8, "⏳ Thinking..."),
+                                });
                                 try render(&vx, writer, &messages, &input_buffer);
 
                                 // 获取 AI 响应
-                                if (on_message(user_input)) |response| {
-                                    try messages.append(allocator, .{
-                                        .role = .assistant,
-                                        .content = try allocator.dupe(u8, response),
-                                    });
+                                const ai_response = on_message(user_input);
+
+                                // 移除 "Thinking..." 消息
+                                if (messages.items.len > 0) {
+                                    if (messages.pop()) |last| {
+                                        allocator.free(last.content);
+                                    }
+                                }
+
+                                // 显示 AI 响应或错误
+                                if (ai_response) |response| {
+                                    defer allocator.free(response); // 释放回调返回的内存
+                                    if (response.len > 0) {
+                                        try messages.append(allocator, .{
+                                            .role = .assistant,
+                                            .content = try allocator.dupe(u8, response),
+                                        });
+                                    } else {
+                                        try messages.append(allocator, .{
+                                            .role = .system,
+                                            .content = try allocator.dupe(u8, "Error: Empty response from AI"),
+                                        });
+                                    }
                                 } else {
                                     try messages.append(allocator, .{
                                         .role = .system,
@@ -300,6 +342,36 @@ pub fn runApp(
                                     .role = .system,
                                     .content = try allocator.dupe(u8, "Messages cleared."),
                                 });
+                            },
+                            .config_wizard => {
+                                allocator.free(user_input);
+                                // 退出 alt screen 运行配置向导
+                                try vx.exitAltScreen(writer);
+                                try writer.flush();
+                                loop.stop();
+
+                                // 运行配置向导
+                                const wizard_success = prompt.runConfigWizard(allocator, ctx.config) catch false;
+
+                                // 重新进入 TUI
+                                try loop.start();
+                                try vx.enterAltScreen(writer);
+                                try writer.flush();
+
+                                if (wizard_success) {
+                                    // 更新 provider 显示
+                                    const p = ctx.config.default_provider.toString();
+                                    const m = if (ctx.config.getDefaultProvider()) |c| c.model else "unknown";
+                                    try messages.append(allocator, .{
+                                        .role = .system,
+                                        .content = try std.fmt.allocPrint(allocator, "Config updated: {s} | {s}", .{ p, m }),
+                                    });
+                                } else {
+                                    try messages.append(allocator, .{
+                                        .role = .system,
+                                        .content = try allocator.dupe(u8, "Configuration cancelled."),
+                                    });
+                                }
                             },
                             .message => |msg| {
                                 allocator.free(user_input);
@@ -373,16 +445,31 @@ fn render(
         _ = win.print(&.{segment}, .{ .col_offset = start_x, .row_offset = 0 });
     }
 
-    // 消息区域
+    // 消息区域 - 先计算所有行数
     {
         const message_area_height: u16 = if (height > 4) height - 4 else 1;
-        var row: u16 = 1;
 
-        const total = messages.items.len;
+        // 计算总行数（每条消息可能有多行）
+        var total_lines: usize = 0;
+        for (messages.items) |msg| {
+            var line_iter = std.mem.splitScalar(u8, msg.content, '\n');
+            while (line_iter.next()) |_| {
+                total_lines += 1;
+            }
+        }
+
+        // 确定从哪里开始显示（滚动到最新消息）
         const max_display: usize = @intCast(message_area_height);
-        const start_idx = if (total > max_display) total - max_display else 0;
+        var lines_to_skip: usize = 0;
+        if (total_lines > max_display) {
+            lines_to_skip = total_lines - max_display;
+        }
 
-        for (messages.items[start_idx..]) |msg| {
+        // 渲染消息
+        var row: u16 = 1;
+        var skipped: usize = 0;
+
+        for (messages.items) |msg| {
             if (row >= message_area_height + 1) break;
 
             const prefix = switch (msg.role) {
@@ -397,20 +484,44 @@ fn render(
                 else => .{ .index = 8 }, // gray for system
             };
 
-            _ = win.print(&.{.{
-                .text = prefix,
-                .style = .{ .fg = color, .bold = true },
-            }}, .{ .row_offset = row, .col_offset = 0 });
+            // 分行显示消息内容
+            var first_line = true;
+            var line_iter = std.mem.splitScalar(u8, msg.content, '\n');
+            while (line_iter.next()) |line| {
+                // 跳过早期行（滚动效果）
+                if (skipped < lines_to_skip) {
+                    skipped += 1;
+                    first_line = false;
+                    continue;
+                }
 
-            const max_len: usize = if (width > 2) @as(usize, width) - 2 else @as(usize, width);
-            const content = if (msg.content.len > max_len) msg.content[0..max_len] else msg.content;
+                if (row >= message_area_height + 1) break;
 
-            _ = win.print(&.{.{
-                .text = content,
-                .style = .{ .fg = color },
-            }}, .{ .row_offset = row, .col_offset = 2 });
+                // 只在第一行显示前缀
+                if (first_line) {
+                    _ = win.print(&.{.{
+                        .text = prefix,
+                        .style = .{ .fg = color, .bold = true },
+                    }}, .{ .row_offset = row, .col_offset = 0 });
+                    first_line = false;
+                } else {
+                    // 续行用空格对齐
+                    _ = win.print(&.{.{
+                        .text = "  ",
+                        .style = .{},
+                    }}, .{ .row_offset = row, .col_offset = 0 });
+                }
 
-            row += 1;
+                const max_len: usize = if (width > 2) @as(usize, width) - 2 else @as(usize, width);
+                const content = if (line.len > max_len) line[0..max_len] else line;
+
+                _ = win.print(&.{.{
+                    .text = content,
+                    .style = .{ .fg = color },
+                }}, .{ .row_offset = row, .col_offset = 2 });
+
+                row += 1;
+            }
         }
     }
 

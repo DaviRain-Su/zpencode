@@ -7,8 +7,10 @@ const std = @import("std");
 
 // Re-export core modules
 pub const config = @import("core/config.zig");
+pub const models = @import("core/models.zig");
 pub const message = @import("models/message.zig");
 pub const tui = @import("tui/app.zig");
+pub const prompt = @import("tui/prompt.zig");
 
 // Re-export commonly used types
 pub const Config = config.Config;

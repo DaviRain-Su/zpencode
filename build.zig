@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai", .module = ai_dep.module("ai") },
             .{ .name = "anthropic", .module = ai_dep.module("anthropic") },
             .{ .name = "openai", .module = ai_dep.module("openai") },
+            .{ .name = "deepseek", .module = ai_dep.module("deepseek") },
         },
     });
 
@@ -81,6 +82,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "ai", .module = ai_dep.module("ai") },
                 .{ .name = "anthropic", .module = ai_dep.module("anthropic") },
                 .{ .name = "openai", .module = ai_dep.module("openai") },
+                .{ .name = "deepseek", .module = ai_dep.module("deepseek") },
             },
         }),
     });
