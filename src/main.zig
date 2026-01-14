@@ -45,7 +45,7 @@ pub fn main() !void {
         try runSimpleMode(allocator, &cfg);
     } else {
         // TUI 模式 - 如果无法初始化 TUI，回退到简单模式
-        runTuiMode(allocator) catch |err| {
+        runTuiMode(allocator, &cfg) catch |err| {
             std.log.warn("TUI mode unavailable ({s}), falling back to simple mode", .{@errorName(err)});
             try runSimpleMode(allocator, &cfg);
         };
@@ -77,8 +77,8 @@ fn printHelp() void {
     ) catch {};
 }
 
-fn runTuiMode(allocator: std.mem.Allocator) !void {
-    try tui.runApp(allocator, &onMessageCallback);
+fn runTuiMode(allocator: std.mem.Allocator, cfg: *config.Config) !void {
+    try tui.runApp(allocator, cfg, &onMessageCallback);
 }
 
 fn onMessageCallback(user_input: []const u8) ?[]const u8 {
