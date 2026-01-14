@@ -7,9 +7,10 @@ const openai = @import("openai");
 const zpencode = @import("zpencode");
 const config = zpencode.config;
 const message = zpencode.message;
+const tui = zpencode.tui;
 
 /// 全局配置
-var global_config: ?config.Config = null;
+var global_config: ?*config.Config = null;
 var global_allocator: std.mem.Allocator = undefined;
 
 pub fn main() !void {
@@ -22,9 +23,91 @@ pub fn main() !void {
     var cfg = config.Config.init(allocator);
     defer cfg.deinit();
     try cfg.loadDefaults();
-    global_config = cfg;
+    global_config = &cfg;
 
-    // 获取 stdout
+    // 解析命令行参数
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var use_simple_mode = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--simple") or std.mem.eql(u8, arg, "-s")) {
+            use_simple_mode = true;
+        }
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printHelp();
+            return;
+        }
+    }
+
+    if (use_simple_mode) {
+        // 简单的命令行模式
+        try runSimpleMode(allocator, &cfg);
+    } else {
+        // TUI 模式 - 如果无法初始化 TUI，回退到简单模式
+        runTuiMode(allocator) catch |err| {
+            std.log.warn("TUI mode unavailable ({s}), falling back to simple mode", .{@errorName(err)});
+            try runSimpleMode(allocator, &cfg);
+        };
+    }
+}
+
+fn printHelp() void {
+    const stdout = std.fs.File.stdout();
+    _ = stdout.write(
+        \\Zpencode - AI Code Assistant
+        \\
+        \\Usage: zpencode [OPTIONS]
+        \\
+        \\Options:
+        \\  -s, --simple    Run in simple CLI mode (no TUI)
+        \\  -h, --help      Show this help message
+        \\
+        \\TUI Mode (default):
+        \\  Ctrl+C or Ctrl+Q - Exit
+        \\  Enter            - Send message
+        \\  Backspace        - Delete character
+        \\
+        \\Simple Mode:
+        \\  /quit, /exit     - Exit the program
+        \\  /help            - Show help
+        \\  /clear           - Clear conversation
+        \\  /provider        - Show current provider
+        \\
+    ) catch {};
+}
+
+fn runTuiMode(allocator: std.mem.Allocator) !void {
+    var app = try tui.App.init(allocator);
+    defer app.deinit();
+
+    // 添加欢迎消息
+    try app.addSystemMessage("Welcome to Zpencode - AI Code Assistant");
+
+    if (global_config) |cfg| {
+        var buf: [128]u8 = undefined;
+        const info = std.fmt.bufPrint(&buf, "Provider: {s} | Model: {s}", .{
+            cfg.default_provider.toString(),
+            if (cfg.getDefaultProvider()) |p| p.model else "unknown",
+        }) catch "Provider info unavailable";
+        try app.addSystemMessage(info);
+    }
+
+    try app.addSystemMessage("Type your message and press Enter. Ctrl+C to exit.");
+
+    try app.run(&onMessageCallback);
+}
+
+fn onMessageCallback(user_input: []const u8) ?[]const u8 {
+    const cfg = global_config orelse return null;
+    return getAIResponse(global_allocator, cfg, user_input) catch |err| {
+        std.log.err("AI Error: {}", .{err});
+        return null;
+    };
+}
+
+fn runSimpleMode(allocator: std.mem.Allocator, cfg: *config.Config) !void {
+    const stdin_file = std.fs.File.stdin();
     const stdout_file = std.fs.File.stdout();
 
     // 显示欢迎信息
@@ -53,14 +136,6 @@ pub fn main() !void {
         \\
         \\
     );
-
-    // 简单的命令行模式
-    try runSimpleMode(allocator, &cfg);
-}
-
-fn runSimpleMode(allocator: std.mem.Allocator, cfg: *config.Config) !void {
-    const stdin_file = std.fs.File.stdin();
-    const stdout_file = std.fs.File.stdout();
 
     var conversation = message.Conversation.init(allocator, null);
     defer conversation.deinit();
