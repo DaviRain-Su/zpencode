@@ -30,6 +30,13 @@ pub const TuiContext = struct {
     on_message: *const fn ([]const u8) ?[]const u8,
 };
 
+/// 状态栏信息
+pub const StatusInfo = struct {
+    provider: []const u8,
+    model: []const u8,
+    total_tokens: usize,
+};
+
 /// 命令处理结果
 const CommandResult = union(enum) {
     none, // 不是命令
@@ -235,6 +242,20 @@ pub fn runApp(
     var input_buffer: std.ArrayList(u8) = .empty;
     defer input_buffer.deinit(allocator);
 
+    // Token 计数（粗略估计：字符数/4）
+    var total_tokens: usize = 0;
+
+    // 辅助函数：获取当前状态栏信息
+    const getStatusInfo = struct {
+        fn call(config: *config_mod.Config, tokens: usize) StatusInfo {
+            return .{
+                .provider = config.default_provider.toString(),
+                .model = if (config.getDefaultProvider()) |c| c.model else "unknown",
+                .total_tokens = tokens,
+            };
+        }
+    }.call;
+
     // 添加欢迎消息
     try messages.append(allocator, .{
         .role = .system,
@@ -257,7 +278,7 @@ pub fn runApp(
     });
 
     // 初始渲染
-    try render(&vx, writer, &messages, &input_buffer);
+    try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
 
     // 主事件循环
     var running = true;
@@ -294,7 +315,7 @@ pub fn runApp(
                                     .role = .system,
                                     .content = try allocator.dupe(u8, "⏳ Thinking..."),
                                 });
-                                try render(&vx, writer, &messages, &input_buffer);
+                                try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
 
                                 // 获取 AI 响应
                                 const ai_response = on_message(user_input);
@@ -314,6 +335,8 @@ pub fn runApp(
                                             .role = .assistant,
                                             .content = try allocator.dupe(u8, response),
                                         });
+                                        // 更新 token 计数（粗略估计：用户输入 + AI 响应）
+                                        total_tokens += (user_input.len + response.len) / 4;
                                     } else {
                                         try messages.append(allocator, .{
                                             .role = .system,
@@ -386,7 +409,7 @@ pub fn runApp(
                             },
                         }
                     }
-                    try render(&vx, writer, &messages, &input_buffer);
+                    try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
                     continue;
                 }
 
@@ -395,19 +418,19 @@ pub fn runApp(
                     if (input_buffer.items.len > 0) {
                         _ = input_buffer.pop();
                     }
-                    try render(&vx, writer, &messages, &input_buffer);
+                    try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
                     continue;
                 }
 
                 // 普通字符输入
                 if (key.text) |text| {
                     try input_buffer.appendSlice(allocator, text);
-                    try render(&vx, writer, &messages, &input_buffer);
+                    try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
                 }
             },
             .winsize => |ws| {
                 try vx.resize(vaxis_allocator, writer, ws);
-                try render(&vx, writer, &messages, &input_buffer);
+                try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
             },
             else => {},
         }
@@ -419,6 +442,7 @@ fn render(
     writer: *std.Io.Writer,
     messages: *std.ArrayList(ChatMessage),
     input_buffer: *std.ArrayList(u8),
+    status_info: StatusInfo,
 ) !void {
     const win = vx.window();
     win.clear();
@@ -426,7 +450,7 @@ fn render(
     const height = win.height;
     const width = win.width;
 
-    if (height < 5 or width < 20) {
+    if (height < 6 or width < 20) {
         try vx.render(writer);
         try writer.flush();
         return;
@@ -451,7 +475,7 @@ fn render(
 
     // 消息区域 - 先计算所有行数
     {
-        const message_area_height: u16 = if (height > 4) height - 4 else 1;
+        const message_area_height: u16 = if (height > 5) height - 5 else 1;
 
         // 计算总行数（每条消息可能有多行）
         var total_lines: usize = 0;
@@ -531,7 +555,7 @@ fn render(
 
     // 分隔线
     {
-        const sep_row: u16 = if (height > 3) height - 3 else 1;
+        const sep_row: u16 = if (height > 4) height - 4 else 1;
         var i: u16 = 0;
         while (i < width) : (i += 1) {
             win.writeCell(i, sep_row, .{
@@ -543,7 +567,7 @@ fn render(
 
     // 输入区域
     {
-        const input_row: u16 = if (height > 2) height - 2 else height - 1;
+        const input_row: u16 = if (height > 3) height - 3 else height - 2;
 
         _ = win.print(&.{.{
             .text = "> ",
@@ -565,6 +589,49 @@ fn render(
 
         const cursor_col: u16 = @intCast(@min(input_buffer.items.len + 2, width - 1));
         win.showCursor(cursor_col, input_row);
+    }
+
+    // 状态栏分隔线
+    {
+        const sep_row: u16 = if (height > 2) height - 2 else height - 1;
+        var i: u16 = 0;
+        while (i < width) : (i += 1) {
+            win.writeCell(i, sep_row, .{
+                .char = .{ .grapheme = "─", .width = 1 },
+                .style = .{ .fg = .{ .index = 8 } },
+            });
+        }
+    }
+
+    // 状态栏
+    {
+        const status_row: u16 = height - 1;
+
+        // 格式: " Provider: xxx | Model: xxx | Tokens: xxx "
+        var status_buf: [256]u8 = undefined;
+        const status_text = std.fmt.bufPrint(&status_buf, " Provider: {s} | Model: {s} | Tokens: {d} ", .{
+            status_info.provider,
+            status_info.model,
+            status_info.total_tokens,
+        }) catch " Status ";
+
+        // 状态栏背景
+        var col: u16 = 0;
+        while (col < width) : (col += 1) {
+            win.writeCell(col, status_row, .{
+                .char = .{ .grapheme = " ", .width = 1 },
+                .style = .{ .bg = .{ .index = 8 } },
+            });
+        }
+
+        // 状态栏文字
+        _ = win.print(&.{.{
+            .text = status_text,
+            .style = .{
+                .fg = .{ .index = 15 }, // white
+                .bg = .{ .index = 8 }, // gray background
+            },
+        }}, .{ .row_offset = status_row, .col_offset = 0 });
     }
 
     try vx.render(writer);
