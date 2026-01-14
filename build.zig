@@ -21,24 +21,28 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
-    // This creates a module, which represents a collection of source files alongside
-    // some compilation options, such as optimization mode and linked system libraries.
-    // Zig modules are the preferred way of making Zig code available to consumers.
-    // addModule defines a module that we intend to make available for importing
-    // to our consumers. We must give it a name because a Zig package can expose
-    // multiple modules and consumers will need to be able to specify which
-    // module they want to access.
-    const mod = b.addModule("zpencode", .{
-        // The root source file is the "entry point" of this module. Users of
-        // this module will only be able to access public declarations contained
-        // in this file, which means that if you have declarations that you
-        // intend to expose to consumers that were defined in other files part
-        // of this module, you will have to make sure to re-export them from
-        // the root file.
-        .root_source_file = b.path("src/root.zig"),
-        // Later on we'll use this module as the root module of a test executable
-        // which requires us to specify a target.
+    // Get vaxis dependency for TUI
+    const vaxis_dep = b.dependency("vaxis", .{
         .target = target,
+        .optimize = optimize,
+    });
+
+    // Get ai-zig dependency for AI providers
+    const ai_dep = b.dependency("zig_ai_sdk", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Create the zpencode library module
+    const mod = b.addModule("zpencode", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
+            .{ .name = "ai", .module = ai_dep.module("ai") },
+            .{ .name = "anthropic", .module = ai_dep.module("anthropic") },
+            .{ .name = "openai", .module = ai_dep.module("openai") },
+        },
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -70,15 +74,13 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
-            // List of modules available for import in source files part of the
-            // root module.
+            // List of modules available for import in source files
             .imports = &.{
-                // Here "zpencode" is the name you will use in your source code to
-                // import this module (e.g. `@import("zpencode")`). The name is
-                // repeated because you are allowed to rename your imports, which
-                // can be extremely useful in case of collisions (which can happen
-                // importing modules from different packages).
                 .{ .name = "zpencode", .module = mod },
+                .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
+                .{ .name = "ai", .module = ai_dep.module("ai") },
+                .{ .name = "anthropic", .module = ai_dep.module("anthropic") },
+                .{ .name = "openai", .module = ai_dep.module("openai") },
             },
         }),
     });
