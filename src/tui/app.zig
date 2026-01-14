@@ -431,11 +431,12 @@ pub fn runAppWithStreaming(
                                     var stream_state = StreamingState.init(allocator);
                                     defer stream_state.deinit();
 
-                                    // 添加空的 AI 响应占位
+                                    // 添加 "思考中" 占位并立即渲染
                                     try messages.append(allocator, .{
                                         .role = .assistant,
-                                        .content = try allocator.dupe(u8, "▌"),
+                                        .content = try allocator.dupe(u8, "⏳ ..."),
                                     });
+                                    try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
 
                                     // 在后台线程中调用流式回调
                                     stream_state.is_streaming = true;
@@ -449,7 +450,7 @@ pub fn runAppWithStreaming(
                                         }
                                     }.run, .{ stream_callback, user_input, &stream_state });
 
-                                    // 轮询更新显示
+                                    // 轮询更新显示（16ms ≈ 60fps）
                                     var last_len: usize = 0;
                                     while (true) {
                                         stream_state.mutex.lock();
@@ -469,7 +470,7 @@ pub fn runAppWithStreaming(
                                                     const display = try std.fmt.allocPrint(allocator, "{s}▌", .{current_content});
                                                     messages.items[messages.items.len - 1].content = display;
                                                 } else {
-                                                    messages.items[messages.items.len - 1].content = try allocator.dupe(u8, "▌");
+                                                    messages.items[messages.items.len - 1].content = try allocator.dupe(u8, "⏳ ...");
                                                 }
                                             }
                                             try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
@@ -478,8 +479,8 @@ pub fn runAppWithStreaming(
 
                                         if (completed) break;
 
-                                        // 短暂休眠避免忙等待
-                                        std.Thread.sleep(50 * std.time.ns_per_ms);
+                                        // 短暂休眠避免忙等待（16ms ≈ 60fps）
+                                        std.Thread.sleep(16 * std.time.ns_per_ms);
                                     }
 
                                     thread.join();
