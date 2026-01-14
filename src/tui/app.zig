@@ -60,6 +60,7 @@ pub const Event = union(enum) {
     winsize: vaxis.Winsize,
     focus_in,
     focus_out,
+    paste: []const u8, // 粘贴事件（IME 输入也可能通过这个发送）
 };
 
 /// 聊天消息
@@ -251,8 +252,10 @@ pub fn runApp(
 
     const writer = tty.writer();
 
-    // 初始化 Vaxis
-    var vx = try vaxis.init(vaxis_allocator, .{});
+    // 初始化 Vaxis（启用 paste allocator 支持粘贴和 IME）
+    var vx = try vaxis.init(vaxis_allocator, .{
+        .system_clipboard_allocator = allocator,
+    });
     defer vx.deinit(vaxis_allocator, writer);
 
     // 初始化事件循环
@@ -268,6 +271,9 @@ pub fn runApp(
 
     // 进入 alt screen
     try vx.enterAltScreen(writer);
+
+    // 启用 bracketed paste（支持 IME 输入）
+    try vx.setBracketedPaste(writer, true);
 
     // 刷新
     try writer.flush();
@@ -474,6 +480,13 @@ pub fn runApp(
             .winsize => |ws| {
                 try vx.resize(vaxis_allocator, writer, ws);
                 try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
+            },
+            .paste => |text| {
+                // 处理粘贴事件（IME 输入也可能通过这里）
+                try input_buffer.appendSlice(allocator, text);
+                try render(&vx, writer, &messages, &input_buffer, getStatusInfo(cfg, total_tokens));
+                // 释放粘贴的文本内存
+                allocator.free(text);
             },
             else => {},
         }
